@@ -1,0 +1,23 @@
+{
+  "title": "Photosynthesis - Chapter 1",
+  "source_url": "local:file://data/raw/ncert_science_class8_photosynthesis.pdf",
+  "extracted_at": "2025-11-17T00:00:00Z",
+  "extractor_version": "0.1.0-stub",
+  "pages": [
+    {
+      "page_no": 1,
+      "blocks": [
+        {"type": "heading", "text": "Photosynthesis"},
+        {"type": "paragraph", "text": "Photosynthesis is the process by which green plants make their own food using sunlight, water and carbon dioxide."},
+        {"type": "paragraph", "text": "Plants take in carbon dioxide from the air and water from the soil. Chlorophyll captures sunlight to power the reaction."}
+      ]
+    },
+    {
+      "page_no": 2,
+      "blocks": [
+        {"type": "heading", "text": "Chemical Equation"},
+        {"type": "paragraph", "text": "6CO2 + 6H2O -> C6H12O6 + 6O2"}
+      ]
+    }
+  ]
+}

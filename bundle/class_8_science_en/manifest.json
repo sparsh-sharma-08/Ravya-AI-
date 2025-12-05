@@ -1,0 +1,10 @@
+{
+  "class": 10,
+  "subject": "Science",
+  "chapter": "Chemical Reactions and Equations",
+  "language": "en",
+  "textbook": "unknown",
+  "chunk_count": 91,
+  "model": "precomputed",
+  "version": "2025.01.00"
+}

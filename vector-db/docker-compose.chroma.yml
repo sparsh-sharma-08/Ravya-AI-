@@ -1,0 +1,20 @@
+version: "3.8"
+services:
+  chroma:
+    platform: linux/amd64
+    image: ghcr.io/chroma-core/chroma:latest
+    container_name: chroma
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      CHROMA_SERVER_HOST: "0.0.0.0"
+      CHROMA_DB_IMPL: "duckdb+parquet"
+    volumes:
+      - ./data/chroma:/chroma
+    # do NOT override command; use image default entrypoint
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health || http://localhost:8000/openapi.json"]
+      interval: 10s
+      timeout: 5s
+      retries: 12

@@ -1,0 +1,9 @@
+{
+  "embedding_model": "intfloat/e5-small-v2",
+  "embedding_dim": 384,
+  "description": "Multilingual embedding model for NCERT/CBSE content.",
+  "license": "MIT",
+  "author": "Your Name",
+  "version": "1.0.0",
+  "date_created": "2023-10-01"
+}

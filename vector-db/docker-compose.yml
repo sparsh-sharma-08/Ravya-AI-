@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  vector-db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+    environment:
+      - NODE_ENV=development
+      - DATABASE_URL=sqlite://db.sqlite
+    command: npm start
+
+  db:
+    image: nouchka/sqlite3
+    volumes:
+      - db_data:/data
+
+volumes:
+  db_data:

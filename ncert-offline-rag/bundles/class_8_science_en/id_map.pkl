@@ -1,0 +1,4 @@
+import pickle
+
+# This file is intended to map chunk IDs to their respective metadata.
+# Currently, it is intentionally left blank as the mapping will be generated during the ingestion process.

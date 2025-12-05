@@ -1,0 +1,45 @@
+{
+  "text": "This is a sample chunk of text for class 8 science. It covers the basics of physics and includes important concepts such as force and motion.",
+  "class": 8,
+  "subject": "science",
+  "chapter": 1,
+  "language": "en",
+  "textbook": "ncert",
+  "tokens": 128
+}
+{
+  "text": "In this chapter, we will explore the concept of force. Force is defined as an interaction that causes an object to change its velocity.",
+  "class": 8,
+  "subject": "science",
+  "chapter": 1,
+  "language": "en",
+  "textbook": "ncert",
+  "tokens": 134
+}
+{
+  "text": "Motion is the change in position of an object with respect to time. There are different types of motion, including linear and rotational motion.",
+  "class": 8,
+  "subject": "science",
+  "chapter": 1,
+  "language": "en",
+  "textbook": "ncert",
+  "tokens": 145
+}
+{
+  "text": "The laws of motion, formulated by Sir Isaac Newton, describe the relationship between the motion of an object and the forces acting on it.",
+  "class": 8,
+  "subject": "science",
+  "chapter": 1,
+  "language": "en",
+  "textbook": "ncert",
+  "tokens": 143
+}
+{
+  "text": "Understanding these concepts is crucial for studying more advanced topics in physics and for practical applications in everyday life.",
+  "class": 8,
+  "subject": "science",
+  "chapter": 1,
+  "language": "en",
+  "textbook": "ncert",
+  "tokens": 138
+}

@@ -1,56 +1,81 @@
 from __future__ import annotations
 import argparse
-import json
 import subprocess
 import sys
-from pathlib import Path
+import os
+import json
 import tempfile
+import time
+from pathlib import Path
+import re
 
-def run_cmd(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"cmd failed: {' '.join(cmd)}\nstderr:\n{r.stderr}")
-    return r.stdout
+def run(cmd, cwd=None):
+    return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=os.environ)
+
+def _find_json_blob(text: str):
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        # fallback: find first {...} JSON object in text
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--text", required=True)
+    p.add_argument("--query", required=True)
     p.add_argument("--bundle", default="./bundle/class_8_science_en")
-    p.add_argument("--model", default="all-mpnet-base-v2")
-    p.add_argument("--k", type=int, default=10)
+    p.add_argument("--model", default="2b")
+    p.add_argument("--k", type=int, default=5)
+    p.add_argument("--embed-model", default="all-mpnet-base-v2")
     args = p.parse_args()
 
-    here = Path(__file__).resolve().parent
-    # fix: embed_query lives under src/pi_runtime
-    embed_py = Path(__file__).resolve().parents[2] / "src" / "pi_runtime" / "embed_query.py"
-    retrieve_py = here / "retrieve.py"
+    project_root = Path(__file__).resolve().parents[3]
+    embed_py = project_root / "ncert-offline-rag" / "src" / "pi_runtime" / "embed_query.py"
+    rag_answer_py = project_root / "ncert-offline-rag" / "src" / "rag" / "rag_answer.py"
 
-    with tempfile.NamedTemporaryFile(prefix="q_", suffix=".json", delete=False) as tf:
-        tmp_path = Path(tf.name)
+    tf = tempfile.NamedTemporaryFile(prefix="q_", suffix=".json", delete=False)
+    embed_path = Path(tf.name)
+    tf.close()
 
-    # create embedding using same python interpreter (venv)
-    run_cmd([sys.executable, str(embed_py), "--text", args.text, "--output", str(tmp_path), "--model", args.model])
+    # create embedding
+    proc = run([sys.executable, str(embed_py), "--text", args.query, "--output", str(embed_path), "--model", args.embed_model], cwd=str(project_root))
+    if proc.returncode != 0:
+        # silent fallback for production
+        print("I'm not sure, you need to refer your teacher")
+        sys.exit(0)
 
-    out = run_cmd([sys.executable, str(retrieve_py), "--bundle", args.bundle, "--embed", str(tmp_path), "--k", str(args.k)])
-    try:
-        data = json.loads(out)
-    except Exception:
-        print("Failed to parse retrieve output:")
-        print(out)
-        sys.exit(1)
+    # allow small delay for file system
+    for _ in range(10):
+        if embed_path.exists() and embed_path.stat().st_size > 10:
+            break
+        time.sleep(0.02)
 
-    if data.get("status") != "ok":
-        print("retrieve status:", data)
-        sys.exit(1)
+    # run rag_answer
+    proc = run([sys.executable, str(rag_answer_py),
+                "--bundle", args.bundle,
+                "--embed", str(embed_path),
+                "--query", args.query,
+                "--k", str(args.k),
+                "--model", args.model],
+               cwd=str(project_root))
 
-    print(f"Top {len(data.get('chunks',[]))} results for: {args.text!r}\n")
-    for c in data["chunks"]:
-        print(f"rank {c['rank']}  score {c['score']:.4f}")
-        print(f"  id: {c['id']}")
-        text = c.get("text","").replace("\n"," ").strip()
-        if len(text) > 300:
-            text = text[:300] + "..."
-        print(f"  snippet: {text}\n")
+    parsed = _find_json_blob(proc.stdout or "")
+    if isinstance(parsed, dict) and parsed.get("status") == "ok" and parsed.get("answer"):
+        # print only the plain answer text
+        print(parsed["answer"].strip())
+        sys.exit(0)
+
+    # fallback message when out-of-context or invalid response
+    print("I'm not sure, you need to refer your teacher")
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

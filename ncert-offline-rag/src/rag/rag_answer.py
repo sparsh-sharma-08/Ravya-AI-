@@ -48,22 +48,44 @@ def _validate_output(parsed: Dict, retrieved_ids: List[str]) -> bool:
         return False
     if not isinstance(srcs, list) or len(srcs) == 0:
         return False
+
+    # build helper sets: full ids and suffix hashes (last '_' segment)
+    full_ids = set(retrieved_ids)
+    hashes = set()
+    for rid in retrieved_ids:
+        if "_" in rid:
+            hashes.add(rid.rsplit("_", 1)[-1])
+
     found = False
     for s in srcs:
         if not isinstance(s, str):
             return False
-        if s in retrieved_ids:
+        s = s.strip()
+        # exact full id match
+        if s in full_ids:
             found = True
+            continue
+        # model may return only the chunk hash (suffix) or a suffix of the id
+        if s in hashes:
+            found = True
+            continue
+        # fallback: check if any retrieved id endswith the returned string
+        if any(rid.endswith(s) for rid in retrieved_ids):
+            found = True
+            continue
     return found
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--bundle", required=True)
-    p.add_argument("--embed", required=True)
-    p.add_argument("--query", required=True)
-    p.add_argument("--k", type=int, default=5)
-    p.add_argument("--model", default="2b", choices=["2b", "7b"])
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bundle", required=True)
+    parser.add_argument("--embed", required=True)
+    parser.add_argument("--query", required=True)
+    parser.add_argument("--k", type=int, default=5)
+    parser.add_argument("--model", default="2b", choices=["2b", "7b"])
+    # add debug arg to the parser
+    parser.add_argument("--debug", action="store_true", help="print retrieval, prompt and raw model output for debugging")
+    parser.add_argument("--plain", action="store_true", help="print only the answer text (no json)")
+    args = parser.parse_args()
 
     try:
         ret = retrieve(args.bundle, args.embed, args.k)
@@ -80,11 +102,36 @@ def main():
 
     prompt = build_prompt(args.query, chunks)
 
+    if args.debug:
+        try:
+            print("DEBUG: retrieve chunks (top-k):", file=sys.stderr)
+            print(json.dumps(ret.get("chunks", []), indent=2, ensure_ascii=False), file=sys.stderr)
+        except Exception as _e:
+            print("DEBUG: failed to print retrieve:", _e, file=sys.stderr)
+
+    if args.debug:
+        try:
+            print("DEBUG: prompt (first 2000 chars):", file=sys.stderr)
+            print((prompt[:2000] if isinstance(prompt, str) else str(prompt)), file=sys.stderr)
+        except Exception as _e:
+            print("DEBUG: failed to print prompt:", _e, file=sys.stderr)
+
     try:
         out_text = call_gemma(prompt, model_variant=args.model)
     except Exception:
         print(json.dumps({"status": "refer_teacher"}, ensure_ascii=False))
         sys.exit(0)
+
+    # debug: print actual returned text and the extracted json blob
+    if args.debug:
+        try:
+            print("DEBUG: model returned (raw):", file=sys.stderr)
+            print(out_text if out_text is not None else "<None>", file=sys.stderr)
+            json_blob_dbg = _extract_json_from_text(out_text)
+            print("DEBUG: extracted JSON blob:", file=sys.stderr)
+            print(json_blob_dbg if json_blob_dbg else "<no json blob found>", file=sys.stderr)
+        except Exception as _e:
+            print("DEBUG: failed to print model output:", _e, file=sys.stderr)
 
     json_blob = _extract_json_from_text(out_text)
     if not json_blob:
@@ -102,7 +149,20 @@ def main():
 
     answer = parsed["answer"].strip()
     sources = parsed["sources"]
-    print(json.dumps({"status": "ok", "answer": answer, "sources": sources}, ensure_ascii=False))
+    result = {"status": "ok", "answer": answer, "sources": sources}
+
+    if args.plain:
+        try:
+            if isinstance(result, dict) and result.get("status") == "ok" and result.get("answer"):
+                print(result["answer"].strip())
+            else:
+                # production-friendly fallback when no confident answer
+                print("I'm not sure, you need to refer your teacher")
+        except Exception:
+            print("I'm not sure, you need to refer your teacher")
+    else:
+        # original behaviour
+        print(json.dumps(result, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()

@@ -365,7 +365,7 @@ if __name__ == "__main__":
     except Exception as exc:
         eprint("Unhandled error:", exc)
         sys.exit(2)
-```# filepath: /Users/sparsh/Documents/Coding/Ravya/ingest_pipeline.py
+# filepath: /Users/sparsh/Documents/Coding/Ravya/ingest_pipeline.py
 """
 Usage:
   python ingest_pipeline.py \
@@ -731,3 +731,5 @@ if __name__ == "__main__":
         eprint("Interrupted by user")
         sys.exit(2)
     except Exception as exc:
+        eprint("Unhandled error:", exc)
+        sys.exit(2)

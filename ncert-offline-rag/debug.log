@@ -1,0 +1,3 @@
+usage: interactive_cli.py [-h] [--bundle BUNDLE] [--model MODEL] [--k K]
+                          [--embed-model EMBED_MODEL] [--threshold THRESHOLD]
+interactive_cli.py: error: unrecognized arguments: --debug

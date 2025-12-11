@@ -9,13 +9,13 @@ CLI to run teacher-mode RAG:
 """
 from __future__ import annotations
 import argparse
-import json
 import re
 import subprocess
 import sys
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+import json
 
 # local imports via importlib when needed
 import importlib.util
@@ -125,6 +125,43 @@ def run_teacher(args_ns: argparse.Namespace) -> Dict[str, Any]:
         parsed_out[k] = parsed.get(k, [] if k.endswith("s") or k in ("materials","learning_outcomes","lesson_steps","assessment","sources") else parsed.get(k, ""))
 
     return parsed_out
+
+def _normalize_sources(parsed: Dict[str, Any]) -> List[str]:
+    """
+    Normalize various source key variants into a clean list of strings.
+    Accepts keys: "sources", "source", "source ", "Sources", "Source"
+    """
+    s = (
+        parsed.get("sources")
+        or parsed.get("source")
+        or parsed.get("source ")
+        or parsed.get("Sources")
+        or parsed.get("Source")
+        or []
+    )
+    if isinstance(s, (str, bytes)):
+        s = [s]
+    if not isinstance(s, (list, tuple)):
+        s = []
+    return [str(x).strip() for x in s if x is not None and str(x).strip()]
+
+def _validate_teacher_response(obj: Any) -> bool:
+    """
+    Strict validation for teacher responses.
+    Requires 'answer' (string) and at least one source id (normalized).
+    """
+    if not isinstance(obj, dict):
+        return False
+    answer = obj.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        return False
+    sources = _normalize_sources(obj)
+    if not sources:
+        return False
+    return True
+
+# Ensure teacher final responses use normalized "sources" key when returned.
+# ...existing code...
 
 def main():
     p = argparse.ArgumentParser()

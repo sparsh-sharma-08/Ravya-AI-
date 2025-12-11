@@ -1,73 +1,45 @@
 from __future__ import annotations
 import argparse
-import subprocess
-import sys
 import json
-import time
-from pathlib import Path
-import tempfile
-
-def run(cmd, cwd=None):
-    return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=None)
+from src.rag.rag_answer import get_rag_answer
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--query", required=True)
-    p.add_argument("--bundle", default="./bundle/class_8_science_en")
-    p.add_argument("--model", default="2b")
-    p.add_argument("--k", type=int, default=5)
-    p.add_argument("--embed-model", default="all-mpnet-base-v2")
-    p.add_argument("--retries", type=int, default=3)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(prog="ask", description="Query the RAG system")
+    parser.add_argument("--query", "-q", required=True, help="User query")
+    parser.add_argument("--k", type=int, default=5, help="number of chunks to retrieve")
+    parser.add_argument("--model", type=str, default="2b", help="model id/size to use")
+    parser.add_argument(
+        "--mode",
+        choices=["student", "teacher"],
+        default="student",
+        help="Response mode: 'student' for short direct answers (default), 'teacher' for long structured notes"
+    )
+    args = parser.parse_args()
 
-    project_root = Path(__file__).resolve().parents[3]
-    embed_py = project_root / "ncert-offline-rag" / "src" / "pi_runtime" / "embed_query.py"
-    rag_answer_py = project_root / "ncert-offline-rag" / "src" / "rag" / "rag_answer.py"
+    result = get_rag_answer(args.query, k=args.k, model=args.model, mode=args.mode)
 
-    tf = tempfile.NamedTemporaryFile(prefix="q_", suffix=".json", delete=False)
-    embed_path = Path(tf.name)
-    tf.close()
-
-    # create embedding
-    proc = run([sys.executable, str(embed_py), "--text", args.query, "--output", str(embed_path), "--model", args.embed_model], cwd=str(project_root))
-    if proc.returncode != 0:
-        print(proc.stderr.strip(), file=sys.stderr)
-        sys.exit(proc.returncode)
-
-    last_stdout = ""
-    last_stderr = ""
-    for attempt in range(1, args.retries + 1):
-        proc = run([sys.executable, str(rag_answer_py),
-                    "--bundle", args.bundle,
-                    "--embed", str(embed_path),
-                    "--query", args.query,
-                    "--k", str(args.k),
-                    "--model", args.model],
-                   cwd=str(project_root))
-        last_stdout = proc.stdout or ""
-        last_stderr = proc.stderr or ""
-        try:
-            j = json.loads(last_stdout)
-        except Exception:
-            j = None
-
-        if isinstance(j, dict) and j.get("status") == "ok":
-            # Print only the returned output and the sources used
-            # First print the JSON answer (as returned)
-            print(json.dumps(j, ensure_ascii=False))
-            # Then print the sources array on its own line for easy parsing
-            print(json.dumps(j.get("sources", []), ensure_ascii=False))
-            sys.exit(0)
-
-        if attempt < args.retries:
-            time.sleep(0.5 * attempt)
-
-    # persistent failure: surface last stdout/stderr minimally
-    if last_stdout:
-        sys.stdout.write(last_stdout)
-    if last_stderr:
-        sys.stderr.write(last_stderr)
-    sys.exit(1)
+    if args.mode == "teacher":
+        if isinstance(result, dict) and result.get("status") == "ok":
+            content = result.get("content", "")
+            sources = result.get("sources", [])
+            print(content)
+            if sources:
+                print("\nSources:", ", ".join(sources))
+        else:
+            print("I'm not confident, please refer your teacher or textbook.")
+    else:
+        # student mode: keep existing behavior (short answer)
+        if isinstance(result, dict) and result.get("status") == "ok":
+            print(result.get("answer") or result.get("content") or "")
+        else:
+            print("I'm not sure, please refer your teacher or textbook.")
 
 if __name__ == "__main__":
     main()
+
+# Usage examples:
+# student:
+# python src/rag/ask.py --query "What is force?" --mode student
+#
+# teacher:
+# python src/rag/ask.py --query "Prepare lecture notes on Newton's laws for class 9" --mode teacher --k 5 --model 2b

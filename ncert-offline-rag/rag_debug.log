@@ -1,0 +1,4 @@
+=== RAG DEBUG ===
+REASON: empty/REFER_TEACHER from retrieve
+retrieve_chunks returned (repr): 'REFER_TEACHER'
+=== END DEBUG ===

@@ -1,13 +1,13 @@
 """
-build_prompt_teacher.py
+Teacher-mode prompt builder.
 
-Builds teacher-mode prompts for modes:
- - lecture_plan
- - detailed_notes
- - study_materials
- - assessment
-
-Provides build_prompt(query, chunks, mode, max_chunks=5).
+Creates a strict instruction prompt that:
+- Addresses the model as "CBSE teacher assistant"
+- Requires using ONLY the provided context chunks
+- Requires JSON output with exact schema:
+  {"content":"<long notes>", "sources":["id1","id2",...]}
+- Includes structured sections and a 200-300+ word requirement
+- Adds the context chunks in the specified "[<chunk_id>]\n<chunk_text>" format
 """
 from __future__ import annotations
 from typing import List, Dict
@@ -57,24 +57,56 @@ Output contract: Produce EXACTLY one JSON object and nothing else with the follo
 
 
 def _format_chunk(c: Dict) -> str:
-    text = c.get("text", "") or ""
-    if len(text) > CHUNK_TRUNC:
-        text = text[:CHUNK_TRUNC] + " [TRUNCATED]"
-    cid = c.get("id", "<no-id>")
-    return f"{cid}\nTEXT: {text}"
+    cid = c.get("id") or c.get("hash") or "<unknown>"
+    text = c.get("text", "")
+    return f"[{cid}]\n{text}\n"
 
 
-def build_prompt(query: str, chunks: List[Dict], mode: str = "lecture_plan", max_chunks: int = 5) -> str:
-    if mode not in MODE_INSTRUCTIONS:
-        raise ValueError("unknown mode")
-    used = chunks[:max_chunks]
-    ctx_lines = [_format_chunk(c) for c in used]
-    context = "\n---\n".join(ctx_lines)
-    instructions = (
-        f"You are an expert teacher assistant. MODE: {mode}\n\n"
-        f"{MODE_INSTRUCTIONS[mode]}\n\n"
-        f"{SCHEMA_TEXT}\n\n"
-        "QUESTION:\n"
+def build_prompt_teacher(question: str, chunks: List[Dict]) -> str:
+    """
+    Build a teacher-mode prompt.
+
+    Args:
+      question: user question string
+      chunks: list of chunk dicts (each with 'id' and 'text' at minimum)
+
+    Returns:
+      A single string prompt to send to the model.
+    """
+    header = (
+        "You are a CBSE teacher assistant. "
+        "Use ONLY the provided context chunks to answer the user's request. "
+        "If the answer is not fully supported by the provided chunks, respond exactly:\n"
+        "I don't know, ask your teacher\n\n"
     )
-    prompt = f"{instructions}{query}\n\nCONTEXT (use only this):\n{context}\n\nReturn the single JSON object now and nothing else."
-    return prompt
+
+    instruction = (
+        "Generate detailed lecture / teaching material targeted at older school students "
+        "and teachers (not toddlers). Produce a structured output with these sections:\n\n"
+        "Overview\n\n"
+        "Learning objectives\n\n"
+        "Key concepts and definitions\n\n"
+        "Stepwise explanation\n\n"
+        "Examples (numerical/real-life as appropriate)\n\n"
+        "Classroom activities / experiments\n\n"
+        "Summary / recap questions\n\n"
+        "Requirements:\n"
+        "- Use ONLY the provided context chunks. Do NOT use external knowledge beyond what is "
+        "explicitly present in the chunks.\n"
+        "- The content must be at least ~200-300 words and suitably detailed.\n"
+        "- Target audience: older school students and teachers.\n\n"
+    )
+
+    json_schema = (
+        "Return ONLY valid JSON with this exact schema (no extra text, no explanation before/after):\n"
+        '{"content":"<long formatted notes as markdown or bullet points>", "sources":["<chunk_id_1>","<chunk_id_2>", ...]}\n\n'
+        "The 'sources' array must include the ids of the chunks you used (at least one),\n"
+        "and 'content' must be non-empty.\n\n"
+    )
+
+    prompt_parts = [header, instruction, json_schema, "User question:\n", f"{question}\n\n", "Context chunks:\n"]
+    for c in chunks:
+        prompt_parts.append(_format_chunk(c))
+
+    prompt_parts.append("\nImportant: If you are not sure, respond exactly: I don't know, ask your teacher\n")
+    return "".join(prompt_parts)

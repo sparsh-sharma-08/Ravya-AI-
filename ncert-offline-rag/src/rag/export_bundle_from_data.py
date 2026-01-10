@@ -17,217 +17,243 @@ Outputs:
         manifest.json
         version.txt
 """
-import argparse
 import json
-import pickle
-import hashlib
-from pathlib import Path
+import os
 from typing import Any, Dict, List
-import numpy as np
+from pathlib import Path
+import sys
+import traceback
 
+# try to import build_prompt_teacher; provide clear fallback if missing
 try:
-    import faiss
-except Exception:  # pragma: no cover
-    faiss = None
-
-REQUIRED_FIELDS = {
-    "text",
-    "class",
-    "subject",
-    "chapter",
-    "language",
-    "textbook",
-    "tokens",
-}
-
-
-def md5_text(s: str) -> str:
-    return hashlib.md5((s or "").encode("utf-8")).hexdigest()
-
-
-def normalize_embedding_matrix(arr: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(arr, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return (arr / norms).astype(np.float32)
-
-
-def _coerce_int(v: Any) -> int:
+    from src.rag.build_prompt_teacher import build_prompt_teacher
+except Exception:
     try:
-        return int(v)
+        from src.rag.build_prompt import build_prompt as build_prompt_teacher
     except Exception:
-        raise RuntimeError(f"Cannot coerce value to int: {v!r}")
+        def build_prompt_teacher(*args, **kwargs):
+            raise ImportError(
+                "build_prompt_teacher not found. Define build_prompt_teacher in src/rag/build_prompt_teacher.py "
+                "or provide src/rag/build_prompt.build_prompt as a fallback."
+            )
 
+def _md5(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
 
-def _flatten_and_validate(obj: Dict[str, Any], line_no: int) -> Dict[str, Any]:
+def collect_json_chunks_from_dir(data_root: Path) -> List[Dict[str, Any]]:
     """
-    Flatten chunk object:
-    - Merge metadata/meta into top-level (metadata overrides top-level)
-    - Ensure required fields present
-    - Enforce types/normalization:
-        class, tokens -> int
-        subject -> lowercase str
-        chapter -> string (may be a title)
-        text -> stripped str
-        hash -> md5 string (preserve if given, else compute)
-    - Compute deterministic id: "<class>_<subject>_<chapter>_<hash8>"
-    Returns flattened dict.
+    Collect JSON files under data_root (recursively) and turn them into flattened chunks.
+    Heuristics to extract text from common JSON shapes.
     """
-    if not isinstance(obj, dict):
-        raise RuntimeError(f"Line {line_no}: chunk is not a JSON object")
-
-    # Start with a shallow copy of top-level (excluding metadata/meta)
-    top = {k: v for k, v in obj.items() if k not in ("metadata", "meta")}
-
-    # Merge metadata (metadata overrides top-level)
-    meta = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
-    if not isinstance(meta, dict):
-        meta = {}
-    # Apply meta over top
-    merged = dict(top)
-    merged.update(meta)
-
-    # Validate presence of required fields
-    missing = REQUIRED_FIELDS - set(merged.keys())
-    if missing:
-        raise RuntimeError(f"Line {line_no} missing required fields: {sorted(missing)}")
-
-    # Normalize types/values
-    text = (merged.get("text") or "").strip()
-    subj = str(merged.get("subject") or "").strip().lower()
-    cls = _coerce_int(merged.get("class"))
-    # Chapter may be a title string (do NOT coerce to int)
-    chap = str(merged.get("chapter") or "").strip().lower()
-    lang = str(merged.get("language") or "").strip()
-    tb = str(merged.get("textbook") or "").strip()
-    tokens = _coerce_int(merged.get("tokens"))
-
-    # Preserve provided hash if present, else compute from text
-    h = merged.get("hash") or merged.get("sha") or md5_text(text)
-    h = str(h)
-
-    # Deterministic id per spec (use chapter string)
-    cid = f"{cls}_{subj}_{chap}_{h[:8]}"
-
-    flat = {
-        "id": cid,
-        "class": cls,
-        "subject": subj,
-        "chapter": chap,
-        "language": lang,
-        "textbook": tb,
-        "tokens": tokens,
-        "hash": h,
-        "text": text,
-    }
-
-    # Preserve any other metadata keys (that are not in standard keys)
-    for k, v in merged.items():
-        if k in flat:
+    data_root = Path(data_root).resolve()
+    chunks: List[Dict[str, Any]] = []
+    for p in sorted(data_root.rglob("*.json")):
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
             continue
-        if k in ("metadata", "meta"):
-            continue
-        flat[k] = v
+        rel = p.relative_to(data_root)
+        parts = rel.parts
+        subject = parts[0] if parts else "unknown"
+        chapter = p.stem.replace(" ", "_").lower()
 
-    return flat
+        def make_chunk(text: str, idx: Optional[int] = None) -> Dict[str, Any]:
+            txt = (text or "").strip()
+            if not txt:
+                return {}
+            h = _md5(txt)
+            suffix = f"_{idx}" if idx is not None else ""
+            cid = f"{subject}_{chapter}_{h[:8]}{suffix}"
+            return {
+                "id": cid,
+                "class": 0,
+                "subject": subject.lower(),
+                "chapter": chapter,
+                "language": "en",
+                "textbook": p.stem,
+                "tokens": len(txt.split()),
+                "hash": h,
+                "text": txt,
+            }
 
+        if isinstance(raw, list):
+            for i, item in enumerate(raw):
+                if isinstance(item, dict):
+                    text = item.get("text") or item.get("content") or json.dumps(item, ensure_ascii=False)
+                else:
+                    text = str(item)
+                c = make_chunk(text, i)
+                if c:
+                    chunks.append(c)
+        elif isinstance(raw, dict):
+            if "chapters" in raw and isinstance(raw["chapters"], list):
+                for i, ch in enumerate(raw["chapters"]):
+                    t = ch.get("text") or ch.get("content") or json.dumps(ch, ensure_ascii=False)
+                    c = make_chunk(t, i)
+                    if c:
+                        chunks.append(c)
+            elif "sections" in raw and isinstance(raw["sections"], list):
+                for i, s in enumerate(raw["sections"]):
+                    t = s.get("text") or s.get("content") or json.dumps(s, ensure_ascii=False)
+                    c = make_chunk(t, i)
+                    if c:
+                        chunks.append(c)
+            else:
+                text = raw.get("text") or raw.get("content") or raw.get("body") or json.dumps(raw, ensure_ascii=False)
+                c = make_chunk(text)
+                if c:
+                    chunks.append(c)
+        else:
+            text = str(raw)
+            c = make_chunk(text)
+            if c:
+                chunks.append(c)
+    return chunks
 
-def export_bundle(data_dir: str, out_bundle: str) -> None:
-    data_dir_p = Path(data_dir)
-    out_dir = Path(out_bundle)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def embed_texts(texts, model_name="all-mpnet-base-v2"):
+    """
+    Compute and L2-normalize embeddings using sentence-transformers.
+    Uses conservative env vars and falls back to sequential encode if batch encoding fails.
+    """
+    if SentenceTransformer is None:
+        raise RuntimeError("sentence-transformers not available; install with: python -m pip install sentence-transformers")
 
-    jsonl_path = data_dir_p / "chapter_1.jsonl"
-    emb_path = data_dir_p / "embeddings.npy"
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-    if not jsonl_path.exists():
-        raise FileNotFoundError(f"Expected JSONL at: {jsonl_path}")
-    if not emb_path.exists():
-        raise FileNotFoundError(f"Expected embeddings.npy at: {emb_path}")
+    model = SentenceTransformer(model_name, device="cpu")
+    try:
+        embs = model.encode(texts, show_progress_bar=True, convert_to_numpy=True, batch_size=32)
+    except Exception:
+        embs_list = []
+        for t in texts:
+            vec = model.encode(t, convert_to_numpy=True)
+            embs_list.append(np.asarray(vec))
+        embs = np.vstack(embs_list)
 
-    # Load chunks in order (line order preserved)
-    raw_chunks: List[Dict[str, Any]] = []
-    with jsonl_path.open("r", encoding="utf-8") as fh:
-        for i, ln in enumerate(fh, start=1):
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                obj = json.loads(ln)
-            except Exception as e:
-                raise RuntimeError(f"Invalid JSON on line {i}: {e}")
-            raw_chunks.append((i, obj))  # keep line number for better errors
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    embs = embs / norms
+    return embs.astype("float32")
 
-    # Load embeddings and validate shape/order alignment
-    embeddings = np.load(str(emb_path))
-    if embeddings.ndim != 2:
-        raise RuntimeError("embeddings.npy must be 2D (N x D)")
-    if len(raw_chunks) != embeddings.shape[0]:
-        raise RuntimeError(f"Chunk count {len(raw_chunks)} != embedding rows {embeddings.shape[0]}")
+def export_bundle_from_collected_chunks(out_bundle: Path, chunks: List[Dict[str, Any]], embeddings: Optional[np.ndarray] = None):
+    out_bundle = Path(out_bundle)
+    out_bundle.mkdir(parents=True, exist_ok=True)
 
-    dim = int(embeddings.shape[1])
-    embeddings_norm = normalize_embedding_matrix(embeddings)
-
-    # Build flattened chunks in same order
-    flattened: List[Dict[str, Any]] = []
-    for line_no, obj in raw_chunks:
-        flat = _flatten_and_validate(obj, line_no)
-        flattened.append(flat)
-
-    # Write chunks.jsonl (one flattened JSON per line)
-    chunks_file = out_dir / "chunks.jsonl"
-    with chunks_file.open("w", encoding="utf-8") as fh:
-        for c in flattened:
+    # write chunks.jsonl
+    with (out_bundle / "chunks.jsonl").open("w", encoding="utf-8") as fh:
+        for c in chunks:
             fh.write(json.dumps(c, ensure_ascii=False) + "\n")
 
-    # Write id_map.pkl as full flattened chunk objects (list)
-    id_map_path = out_dir / "id_map.pkl"
-    with id_map_path.open("wb") as fh:
-        pickle.dump(flattened, fh)
+    # write id_map.pkl (store minimal metadata)
+    id_map = []
+    for c in chunks:
+        id_map.append({
+            "id": c.get("id"),
+            "subject": c.get("subject"),
+            "chapter": c.get("chapter"),
+            "textbook": c.get("textbook"),
+            "tokens": c.get("tokens"),
+            "hash": c.get("hash"),
+            "text": c.get("text"),
+        })
+    with (out_bundle / "id_map.pkl").open("wb") as f:
+        pickle.dump(id_map, f)
 
-    # Write embeddings.bin (normalized float32 bytes)
-    emb_bin_path = out_dir / "embeddings.bin"
-    emb_bytes = embeddings_norm.astype(np.float32).tobytes()
-    emb_bin_path.write_bytes(emb_bytes)
+    # optional embeddings + index
+    if embeddings is not None:
+        if embeddings.shape[0] != len(chunks):
+            raise RuntimeError("embeddings row count does not match number of chunks")
+        (out_bundle / "embeddings.bin").write_bytes(embeddings.astype("float32").tobytes())
+        if faiss is not None:
+            d = int(embeddings.shape[1])
+            index = faiss.IndexFlatIP(d)
+            index.add(embeddings)
+            faiss.write_index(index, str(out_bundle / "index.faiss"))
+        with (out_bundle / "model.json").open("w", encoding="utf-8") as f:
+            json.dump({"name": "precomputed", "dim": int(embeddings.shape[1])}, f, ensure_ascii=False)
 
-    # Build and write FAISS index (inner-product on normalized vectors)
-    if faiss is None:
-        raise RuntimeError("faiss is required to build index (install faiss-cpu).")
-    index = faiss.IndexFlatIP(dim)
-    index.add(np.ascontiguousarray(embeddings_norm))
-    faiss.write_index(index, str(out_dir / "index.faiss"))
-
-    # model.json
-    model_json = {"name": "precomputed", "dim": dim}
-    (out_dir / "model.json").write_text(json.dumps(model_json, indent=2), encoding="utf-8")
-
-    # manifest.json using first chunk metadata (chapter kept as string)
-    first = flattened[0]
     manifest = {
-        "class": first["class"],
-        "subject": first["subject"],
-        "chapter": first["chapter"],
-        "language": first["language"],
-        "textbook": first["textbook"],
-        "chunk_count": len(flattened),
-        "model": "precomputed",
-        "version": "2025.01.00",
+        "class": chunks[0].get("class", 0) if chunks else 0,
+        "subject": chunks[0].get("subject", "unknown") if chunks else "unknown",
+        "chapter": chunks[0].get("chapter", "unknown") if chunks else "unknown",
+        "language": chunks[0].get("language", "en") if chunks else "en",
+        "textbook": chunks[0].get("textbook", "unknown") if chunks else "unknown",
+        "chunk_count": len(chunks),
+        "model": "precomputed" if embeddings is not None else "none",
+        "version": "2025.01.00"
     }
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    with (out_bundle / "manifest.json").open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    with (out_bundle / "version.txt").open("w", encoding="utf-8") as f:
+        f.write("2025.01.00\n")
 
-    # version.txt
-    (out_dir / "version.txt").write_text("2025.01.00\n", encoding="utf-8")
-
-    print(f"Wrote bundle to {out_dir} (chunks={len(flattened)} dim={dim})")
-
-
-def main() -> int:
-    p = argparse.ArgumentParser(description="Export deterministic FAISS bundle")
-    p.add_argument("--data-dir", required=True, help="Directory containing chapter_1.jsonl and embeddings.npy")
-    p.add_argument("--out-bundle", required=True, help="Output bundle directory")
+def main():
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--data-dir", required=True, help="Path to data dir (JSONL file or a folder containing JSON files)")
+    p.add_argument("--out-bundle", required=True, help="Output bundle path")
+    p.add_argument("--compute-embeddings", action="store_true", help="Compute embeddings using sentence-transformers (optional)")
+    p.add_argument("--embed-model", default="all-mpnet-base-v2", help="Sentence-transformers model name")
     args = p.parse_args()
-    export_bundle(args.data_dir, args.out_bundle)
-    return 0
 
+    data_path = Path(args.data_dir)
+    out_bundle = Path(args.out_bundle)
+
+    # JSONL/ndjson input support
+    if data_path.is_file() and data_path.suffix in (".jsonl", ".ndjson"):
+        try:
+            export_bundle(data_path, out_bundle)  # try to reuse older flow if present
+            return 0
+        except NameError:
+            chunks = []
+            for line in data_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                text = obj.get("text") or obj.get("content") or json.dumps(obj, ensure_ascii=False)
+                if not text.strip():
+                    continue
+                h = _md5(text)
+                cid = obj.get("id") or f"unknown_{data_path.stem}_{h[:8]}"
+                chunks.append({
+                    "id": cid,
+                    "class": obj.get("class", 0),
+                    "subject": obj.get("subject", "unknown"),
+                    "chapter": obj.get("chapter", data_path.stem),
+                    "language": obj.get("language", "en"),
+                    "textbook": obj.get("textbook", data_path.stem),
+                    "tokens": obj.get("tokens", len(text.split())),
+                    "hash": h,
+                    "text": text,
+                })
+            if not chunks:
+                raise SystemExit(f"No valid chunks found in {data_path}")
+            embeddings = None
+            if args.compute_embeddings:
+                texts = [c["text"] for c in chunks]
+                embeddings = embed_texts(texts, model_name=args.embed_model)
+            export_bundle_from_collected_chunks(out_bundle, chunks, embeddings)
+            print("Export complete:", out_bundle)
+            return 0
+
+    # Directory input: collect .json files recursively
+    if data_path.is_dir():
+        chunks = collect_json_chunks_from_dir(data_path)
+        if not chunks:
+            raise SystemExit(f"No JSON files/chunks found under: {data_path}")
+        embeddings = None
+        if args.compute_embeddings:
+            texts = [c["text"] for c in chunks]
+            embeddings = embed_texts(texts, model_name=args.embed_model)
+        export_bundle_from_collected_chunks(out_bundle, chunks, embeddings)
+        print("Export complete:", out_bundle)
+        return 0
+
+    raise SystemExit(f"Path not found or unsupported: {data_path}")
 
 if __name__ == "__main__":
     raise SystemExit(main())

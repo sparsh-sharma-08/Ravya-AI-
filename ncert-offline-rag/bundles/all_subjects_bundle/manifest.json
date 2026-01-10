@@ -1,0 +1,10 @@
+{
+  "class": 0,
+  "subject": "english",
+  "chapter": "1-5",
+  "language": "en",
+  "textbook": "1-5",
+  "chunk_count": 132,
+  "model": "precomputed",
+  "version": "2025.01.00"
+}

@@ -10,17 +10,30 @@ import argparse
 import json
 import os
 import sys
-from pathlib import Path
-
+from typing import Any, Dict, List, Optional, Union
+from pathlib import Path   #Path importing
+import re
 import numpy as np
 import subprocess
-import tempfile
-from typing import Any, Dict, List, Optional, Sequence, Union
-import re
-from typing import List, Dict, Any, Optional
+# add requests import where top-level imports are; fallback to subprocess if requests missing
+try:
+    import requests
+except Exception:
+    requests = None
 
-from src.rag.build_prompt import build_prompt
-from src.rag.build_prompt_teacher import build_prompt_teacher
+# try to import build_prompt_teacher; provide clear fallback if missing
+try:
+    from src.rag.build_prompt_teacher import build_prompt_teacher
+except Exception:
+    try:
+        from src.rag.build_prompt import build_prompt as build_prompt_teacher
+    except Exception:
+        def build_prompt_teacher(*args, **kwargs):
+            raise ImportError(
+                "build_prompt_teacher not found. Define build_prompt_teacher in src/rag/build_prompt_teacher.py "
+                "or provide src/rag/build_prompt.build_prompt as a fallback."
+            )
+
 # Robustly import the model-call function from call_gema.py.
 # Some files export `call_gema`, others `call_gemma`; support both.
 try:
@@ -37,18 +50,75 @@ except Exception:
             _call_model_fn = getattr(mod, "call_gemma")
         else:
             raise ImportError("no call_gema/call_gemma function found in src.rag.call_gema")
-from src.pi_runtime.retrieve import retrieve_chunks
+from src.pi_runtime.retrieve import retrieve, retrieve_chunks
 
 
 # ---------------- Validators -------------------------------------------------
-def _ensure_chunk_ids(chunks_or_ids: Optional[Union[Sequence[Dict[str, Any]], Sequence[str]]]) -> set:
+def _ensure_chunk_ids(chunks_or_ids: Union[List[Dict[str, Any]], List[str], Dict]) -> List[str]:
+    """
+    Normalize retrieved chunk list or id-map into list of chunk ids.
+    """
     if not chunks_or_ids:
-        return set()
-    first = next(iter(chunks_or_ids), None)
-    if isinstance(first, dict):
-        return {c.get("id") for c in chunks_or_ids if isinstance(c, dict) and c.get("id")}
-    return set(chunks_or_ids)  # assume list of ids
+        return []
+    if isinstance(chunks_or_ids, dict):
+        try:
+            return [str(v.get("id")) for k, v in sorted(chunks_or_ids.items(), key=lambda x: int(x[0])) if v.get("id")]
+        except Exception:
+            return [str(v.get("id")) for v in chunks_or_ids.values() if isinstance(v, dict) and v.get("id")]
+    if isinstance(chunks_or_ids, list) and len(chunks_or_ids) > 0 and isinstance(chunks_or_ids[0], dict):
+        return [str(c.get("id")) for c in chunks_or_ids if c.get("id")]
+    return [str(x) for x in chunks_or_ids]
 
+def retrieve_chunks(bundle_path: str, query: str, k: int = 5, mode: str = "student", embed_model: str = "all-mpnet-base-v2"):
+    """
+    Compatibility wrapper used by src.rag.rag_answer: returns {'chunks': [...]}
+    """
+    results = retrieve(bundle_path, query, k=k, mode=mode, embed_model=embed_model)
+    return {"chunks": results}
+
+def _normalize_source_token(s: str) -> str:
+    s = str(s or "").strip()
+    s = re.sub(r'^(text/|chunks/|chunk/|source:)\s*', '', s, flags=re.IGNORECASE)
+    if "/" in s:
+        s = s.split("/")[-1]
+    return s
+
+def _expand_source_tokens(raw_sources: List[Any], retrieved_chunks: List[Dict[str, Any]]) -> List[str]:
+    """
+    Map model-declared source tokens to full chunk ids from retrieved_chunks.
+    Preserves order and deduplicates.
+    """
+    if not raw_sources:
+        return []
+    candidate_ids = _ensure_chunk_ids(retrieved_chunks)
+    cand_set = set(candidate_ids)
+    normalized: List[str] = []
+    seen = set()
+
+    for src in raw_sources:
+        if src is None:
+            continue
+        s = _normalize_source_token(src)
+        # exact match
+        if s in cand_set and s not in seen:
+            normalized.append(s); seen.add(s); continue
+        # try exact on original raw (maybe already full)
+        if str(src) in cand_set and str(src) not in seen:
+            normalized.append(str(src)); seen.add(str(src)); continue
+        # suffix/substring match
+        matched = None
+        for cid in candidate_ids:
+            if cid.endswith(s) or s in cid:
+                matched = cid
+                break
+        if matched and matched not in seen:
+            normalized.append(matched); seen.add(matched)
+    return normalized
+
+def _chunks_all_empty(chunks: List[Dict[str, Any]]) -> bool:
+    if not chunks:
+        return True
+    return all(not (c.get("text") or "").strip() for c in chunks)
 
 def _validate_student_response(obj: Any, retrieved_chunks: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
     """
@@ -93,21 +163,28 @@ def _validate_student_response(obj: Any, retrieved_chunks: Optional[List[Dict[st
     return {"answer": answer, "sources": sources}
 
 
-def _validate_teacher_response(parsed: Dict[str, Any], chunks_or_ids: Optional[Union[List[Dict[str, Any]], List[str]]]) -> bool:
+def _validate_teacher_response(parsed: Dict[str, Any], chunks_or_ids: Union[List[Dict[str, Any]], List[str], Dict]) -> bool:
     """
-    Accepts {"content":"...","sources":[...]}
-    Require non-empty content and at least one source matching chunk ids.
+    Accept 'content' OR 'answer' as the teacher text.
+    Require non-empty content and a non-empty list of sources, and at least one source matching retrieved chunk ids.
     """
     if not isinstance(parsed, dict):
         return False
-    content = parsed.get("content")
+
+    content = (parsed.get("content") or parsed.get("answer") or "")
     sources = parsed.get("sources")
-    if not content or not isinstance(sources, list) or len(sources) == 0:
+
+    if not content or not isinstance(content, str):
         return False
+    if not isinstance(sources, list) or len(sources) == 0:
+        return False
+
     chunk_ids = _ensure_chunk_ids(chunks_or_ids)
     if not chunk_ids:
+        # no retrieved ids to validate against -> accept as long as content+sources present
         return True
-    return any(s in chunk_ids for s in sources)
+
+    return any(str(s) in chunk_ids for s in sources)
 
 
 # ---------------- Helpers ---------------------------------------------------
@@ -402,6 +479,44 @@ def _heuristic_extract_answer_sources(text: str) -> Optional[Dict[str, Any]]:
     return result
 
 
+def _normalize_teacher_sources(raw_sources, retrieved_chunks):
+    """
+    Normalize model-declared sources to full chunk ids from retrieved_chunks.
+    - strip common prefixes
+    - match exact or by suffix
+    - deduplicate while preserving order
+    """
+    if not raw_sources:
+        return []
+    # build lookup
+    valid_ids = [c.get("id") for c in retrieved_chunks if isinstance(c, dict) and c.get("id")]
+    valid_set = set(valid_ids)
+
+    def normalize_str(s: str) -> str:
+        s = str(s).strip()
+        # remove common prefixes and whitespace
+        s = re.sub(r'^(text/|chunks/|chunk/|source:)\s*', '', s, flags=re.IGNORECASE)
+        # use last path component if contains '/'
+        if "/" in s:
+            s = s.split("/")[-1]
+        return s
+
+    seen = {}
+    normalized = []
+    for raw in raw_sources:
+        s = normalize_str(raw)
+        # exact
+        if s in valid_set and s not in seen:
+            normalized.append(s); seen[s] = True; continue
+        # suffix match or contained
+        for cid in valid_ids:
+            if cid.endswith(s) or s in cid:
+                if cid not in seen:
+                    normalized.append(cid); seen[cid] = True
+                break
+    return normalized
+
+
 # ---------------- Orchestrator ------------------------------------------------
 def get_rag_answer(
     bundle: str,
@@ -536,9 +651,28 @@ def get_rag_answer(
 
     # Validate and format output
     if mode == "teacher":
+        # 1) If all retrieved chunks are empty, return empty teacher response (no hallucination)
+        if _chunks_all_empty(chunks):
+            return {
+                "status": "ok",
+                "mode": "teacher",
+                "content": "",
+                "sources": []
+            }
+
+        # 2) Normalize/expand model-declared sources BEFORE validation
+        raw_sources = parsed.get("sources", [])
+        parsed["sources"] = _expand_source_tokens(raw_sources, chunks)
+
+        # 3) Validate using robust validator
         if not _validate_teacher_response(parsed, chunks):
             return _refer("teacher validation failed", ret=ret, chunks=chunks, prompt=prompt, model_output=model_output)
-        return {"status": "ok", "mode": "teacher", "content": parsed["content"], "sources": parsed["sources"]}
+        return {
+            "status": "ok",
+            "mode": "teacher",
+            "content": parsed.get("content") or parsed.get("answer") or "",
+            "sources": parsed.get("sources", [])
+        }
     else:
         if not _validate_student_response(parsed, chunks):
             # try to extract fallback free-text
@@ -611,6 +745,255 @@ def _handle_model_output(mode: str, model_output: str, retrieved_chunks: List[Di
     if not answer_text:
         return {"status": "refer_teacher"}
     return {"status": "ok", "mode": "student", "answer": answer_text, "sources": []}
+
+
+def _call_llama_cpp(prompt: str, max_tokens: int = 256, temperature: float = 0.0) -> str:
+    """
+    Call a local Llama (llama-cpp-python) model. Requires:
+      - pip install llama-cpp-python
+      - a local GGML model file (set LLAMA_CPP_MODEL env var to path)
+      - set RAG_ENABLE_LOCAL_LLM=1 to enable
+    """
+    model_path = os.environ.get("LLAMA_CPP_MODEL", "")
+    if not model_path or not Path(model_path).exists():
+        raise RuntimeError("LLAMA_CPP_MODEL not set or file not found")
+    try:
+        from llama_cpp import Llama  # type: ignore
+        ctx = int(os.environ.get("LLAMA_CTX", "2048"))
+        n_threads = int(os.environ.get("LLAMA_THREADS", "2"))
+        llm = Llama(model_path=model_path, n_ctx=ctx, n_threads=n_threads)
+        resp = llm(prompt, max_tokens=max_tokens, temperature=float(temperature))
+        # llama-cpp-python returns {'choices':[{'text': '...'}], ...}
+        return resp.get("choices", [{}])[0].get("text", "") or ""
+    except Exception as e:
+        raise RuntimeError(f"llama-cpp failed: {e}") from e
+
+def _call_ollama(prompt: str, max_tokens: int = 256, temperature: float = 0.0) -> str:
+    """
+    Call local Ollama server (preferred) or ollama CLI (fallback).
+    Handles streaming JSON lines (SSE-like) by concatenating 'response' fragments.
+    """
+    host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+    model = os.environ.get("OLLAMA_MODEL")
+    if not model:
+        raise RuntimeError("OLLAMA_MODEL not set (set to the model name you pulled with `ollama pull`).")
+
+    # Try HTTP API first if requests available
+    if requests is not None:
+        try:
+            url = f"{host}/api/generate"
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "max_tokens": int(max_tokens),
+                "temperature": float(temperature),
+            }
+            # stream=True to handle line-delimited JSON streaming responses
+            resp = requests.post(url, json=payload, timeout=60, stream=True)
+            resp.raise_for_status()
+
+            result_text = ""
+            # iterate over streamed lines (each line is a JSON object in many Ollama versions)
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                line = raw_line.strip()
+                # try parse JSON line
+                try:
+                    j = None
+                    import json as _json
+                    j = _json.loads(line)
+                    # common streaming field that contains generated fragment
+                    if isinstance(j, dict):
+                        # if model returns fragmented content under 'response'
+                        if "response" in j and isinstance(j["response"], str):
+                            result_text += j["response"]
+                        # some versions use 'output' or 'text' for final payload
+                        elif "output" in j and isinstance(j["output"], str):
+                            result_text = j["output"]
+                        elif "text" in j and isinstance(j["text"], str):
+                            result_text = j["text"]
+                        # break if stream indicates done
+                        if j.get("done") is True:
+                            break
+                except Exception:
+                    # not JSON line -> treat as raw text fragment
+                    try:
+                        result_text += line + ("\n" if not line.endswith("\n") else "")
+                    except Exception:
+                        pass
+
+            # final fallback: if nothing assembled, try resp.text
+            if not result_text:
+                result_text = resp.text or ""
+
+            return result_text
+        except Exception as e:
+            if os.environ.get("RAG_DEBUG") == "1":
+                print("DEBUG: Ollama HTTP call failed (streaming):", e)
+
+    # Fallback: use ollama CLI if available
+    try:
+        cmd = ["ollama", "run", model]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = proc.communicate(prompt, timeout=60)
+        if proc.returncode == 0 and out:
+            return out.strip()
+        raise RuntimeError(f"ollama CLI failed rc={proc.returncode} stderr={err.strip()}")
+    except Exception as e:
+        if os.environ.get("RAG_DEBUG") == "1":
+            print("DEBUG: Ollama CLI fallback failed:", e)
+        raise RuntimeError(f"Ollama backend failed: {e}") from e
+
+def _call_any_llm(prompt: str, max_tokens: int = 256, temperature: float = 0.0) -> str:
+    # 0) Ollama local server (highest priority when enabled)
+    try:
+        if os.environ.get("RAG_ENABLE_OLLAMA", "0") == "1":
+            return _call_ollama(prompt, max_tokens=max_tokens, temperature=temperature)
+    except Exception as e:
+        if os.environ.get("RAG_DEBUG") == "1":
+            print("DEBUG: ollama backend error:", e)
+
+    # 1) repo-local pi_runtime llm
+    try:
+        from src.pi_runtime import llm as _pi_llm  # type: ignore
+        for fn in ("generate", "call", "run", "complete"):
+            if hasattr(_pi_llm, fn):
+                return getattr(_pi_llm, fn)(prompt, max_tokens=max_tokens, temperature=temperature)
+        if hasattr(_pi_llm, "call_llm"):
+            return _pi_llm.call_llm(prompt, max_tokens=max_tokens, temperature=temperature)
+    except Exception:
+        pass
+
+    # 2) repo-local rag llm
+    try:
+        from src.rag import llm as _rag_llm  # type: ignore
+        for fn in ("generate", "call", "run", "complete"):
+            if hasattr(_rag_llm, fn):
+                return getattr(_rag_llm, fn)(prompt, max_tokens=max_tokens, temperature=temperature)
+    except Exception:
+        pass
+
+    # 3) OpenAI (if available)
+    try:
+        if os.environ.get("OPENAI_API_KEY"):
+            import openai
+            resp = openai.Completion.create(engine="text-davinci-003", prompt=prompt, max_tokens=max_tokens, temperature=temperature)
+            return resp.choices[0].text
+    except Exception:
+        pass
+
+    return f"<<NO_LLM_AVAILABLE>>\n{prompt}"
+
+def _synthesize_answer_from_chunks(question: str, chunks: list, mode: str = "student"):
+    """
+    Lightweight offline synthesizer:
+    - Extracts candidate sentences from chunk texts
+    - Scores sentences by overlap with question tokens
+    - Returns {'answer': str, 'sources': [chunk_ids]}
+    """
+    import re
+    q_tokens = [w for w in re.findall(r"\w+", question.lower()) if len(w) > 2]
+    candidates = []
+    for c in chunks:
+        cid = c.get("id")
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        sents = re.split(r'(?<=[\.\?\!])\s+', text)
+        for s in sents:
+            s_clean = s.strip()
+            if not s_clean:
+                continue
+            lw = s_clean.lower()
+            score = sum(lw.count(t) for t in q_tokens)
+            # small length bias to prefer longer informative sentences
+            score += min(1.0, len(s_clean) / 200.0) * 0.1
+            candidates.append((score, cid, s_clean))
+    # choose best sentences
+    candidates = [c for c in candidates if c[0] > 0]
+    if not candidates:
+        # fallback: first sentence from first up to 3 chunks
+        out = []
+        used = []
+        for c in chunks[:3]:
+            t = (c.get("text") or "").strip()
+            if not t:
+                continue
+            first_sent = re.split(r'(?<=[\.\?\!])\s+', t)[0].strip()
+            if first_sent:
+                out.append(first_sent)
+                used.append(c.get("id"))
+        answer = " ".join(out) if out else "No relevant information found in the provided chunks."
+        return {"answer": answer, "sources": used}
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    top = candidates[:3]
+    answer = " ".join([s for _, _, s in top])
+    sources = list(dict.fromkeys([cid for _, cid, _ in top]))
+    return {"answer": answer, "sources": sources}
+
+
+# modify get_rag_answer_with_llm behavior to synthesize when no LLM is available
+def get_rag_answer_with_llm(bundle: str, question: str, mode: str = "student", k: int = 5, **call_opts) -> dict:
+    """
+    Retrieve top-k chunks from the bundle and call an LLM to generate an answer.
+    Falls back to offline synthesizer if no LLM is available.
+    """
+    # retrieve chunks using compatibility wrapper
+    try:
+        from src.pi_runtime.retrieve import retrieve_chunks
+        res = retrieve_chunks(bundle, question, k=k, mode=mode)
+        chunks = res.get("chunks", []) if isinstance(res, dict) else res
+    except Exception:
+        from src.pi_runtime.retrieve import retrieve
+        chunks = retrieve(bundle, question, k=k, mode=mode)
+
+    # build simple prompt (kept for LLM paths)
+    ctx = "\n\n".join([f"{c.get('id')}\n{(c.get('text') or '')}" for c in chunks])
+    if mode == "teacher":
+        prompt = (
+            "You are a teacher. Use ONLY the context below to answer the question. "
+            "Return a JSON object with keys: answer (string), sources (list of chunk ids).\n\n"
+            f"QUESTION:\n{question}\n\nCONTEXT:\n{ctx}\n"
+        )
+    else:
+        prompt = (
+            "Answer the question using the context below. Be concise and student-friendly.\n\n"
+            f"QUESTION:\n{question}\n\nCONTEXT:\n{ctx}\n"
+        )
+
+    raw = _call_any_llm(prompt, max_tokens=call_opts.get("max_tokens", 256), temperature=call_opts.get("temperature", 0.0))
+
+    out = {"status": "ok", "answer": "", "sources": [], "raw": raw, "chunks": chunks}
+
+    # If no LLM available, synthesize from chunks offline
+    if isinstance(raw, str) and raw.startswith("<<NO_LLM_AVAILABLE>>"):
+        synth = _synthesize_answer_from_chunks(question, chunks, mode=mode)
+        out["answer"] = synth["answer"]
+        out["sources"] = synth.get("sources", [])
+        out["status"] = "synthesized_offline"
+        return out
+
+    # existing teacher/student processing (unchanged)
+    if mode == "teacher":
+        try:
+            first = raw.find("{")
+            candidate = raw[first:] if first != -1 else raw
+            parsed = json.loads(candidate)
+            out["answer"] = parsed.get("answer", "")
+            out["sources"] = parsed.get("sources", []) or []
+            if not out["answer"].strip() and not out["sources"]:
+                out["status"] = "out_of_syllabus"
+        except Exception:
+            out["status"] = "refer_teacher"
+            out["answer"] = ""
+    else:
+        out["answer"] = raw
+        import re as _re
+        ids = _re.findall(r"[A-Za-z0-9_\-]+_[A-Za-z0-9_\-]+_[0-9a-f]{8}_[0-9]+", raw)
+        out["sources"] = list(dict.fromkeys(ids))[:10]
+
+    return out
 
 
 # ---------------- CLI -------------------------------------------------------

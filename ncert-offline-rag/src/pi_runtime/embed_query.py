@@ -16,38 +16,57 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List, Optional
+import os
+from typing import Optional, List
 
 import numpy as np
 
 try:
     from sentence_transformers import SentenceTransformer
 except Exception:
-    SentenceTransformer = None  # handled below
+    SentenceTransformer = None
+
+
+# module-level cache
+_S_MODEL: Optional[SentenceTransformer] = None
+_S_MODEL_NAME: Optional[str] = None
+
+
+def _prepare_env_for_tokenizers():
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+
+def get_sentence_model(model_name: str = "all-mpnet-base-v2"):
+    global _S_MODEL, _S_MODEL_NAME
+    if SentenceTransformer is None:
+        raise RuntimeError(
+            "sentence-transformers not installed; install with: python -m pip install sentence-transformers"
+        )
+    if _S_MODEL is None or _S_MODEL_NAME != model_name:
+        _prepare_env_for_tokenizers()
+        _S_MODEL = SentenceTransformer(model_name, device="cpu")
+        _S_MODEL_NAME = model_name
+    return _S_MODEL
 
 
 def compute_embedding(texts: List[str], model_name: str) -> np.ndarray:
-    if SentenceTransformer is None:
-        raise RuntimeError(
-            "sentence-transformers not available in this environment. "
-            "Install on laptop/cloud only: pip install sentence-transformers"
-        )
-    model = SentenceTransformer(model_name)
-    # prefer convert_to_numpy and normalize if available
+    model = get_sentence_model(model_name)
     try:
-        emb = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-    except TypeError:
-        # older ST versions may not support normalize_embeddings arg
-        emb = model.encode(texts, convert_to_numpy=True)
-        # manual L2 normalization
-        norms = np.linalg.norm(emb, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        emb = emb / norms
-    if emb.dtype != np.float32:
-        emb = emb.astype(np.float32)
-    if emb.ndim == 1:
-        emb = emb.reshape(1, -1)
-    return emb
+        embs = model.encode(texts, show_progress_bar=False, convert_to_numpy=True, batch_size=32)
+    except Exception:
+        out = []
+        for t in texts:
+            vec = model.encode(t, convert_to_numpy=True)
+            out.append(np.asarray(vec))
+        embs = np.vstack(out)
+    # L2 normalize
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    embs = embs / norms
+    return embs.astype("float32")
 
 
 def write_output(vec: np.ndarray, out_path: Path) -> None:

@@ -27,7 +27,7 @@ def run(cmd: List[str], cwd: Optional[str] = None) -> subprocess.CompletedProces
     env = os.environ.copy()
     return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=env, timeout=RETRIEVE_TIMEOUT)
 
-def _find_json_blob(text: str) -> Optional[Dict[str, Any]]:
+def _find_json_blob(text: str) -> Optiona[Dict[str, Any]]:
     if not text:
         return None
     try:

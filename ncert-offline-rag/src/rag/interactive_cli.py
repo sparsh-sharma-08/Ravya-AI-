@@ -7,7 +7,10 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from src.rag.rag_answer import get_rag_answer
+try:
+    from src.rag.rag_answer import get_rag_answer_with_llm
+except Exception:
+    get_rag_answer_with_llm = None
 
 def _find_embed_script() -> Optional[Path]:
     repo_root = Path(__file__).resolve().parents[3]
@@ -71,46 +74,43 @@ def interactive(bundle: str, model: str, k: int, embed_model: str, mode: str):
 
     while True:
         try:
-            q = input("\nQuestion (or command): ").strip()
+            user_input = input("\nQuestion (or command): ")
         except (EOFError, KeyboardInterrupt):
             print()
             break
 
-        if not q:
-            print("Empty question; try again.")
+        if user_input.strip() == "":
             continue
 
-        if q.lower() in ("q", "quit", "exit", "/quit"):
-            break
+        q = user_input.strip()
 
-        # mode commands
-        if q.startswith("/mode"):
-            parts = q.split()
-            if len(parts) == 1:
-                print(f"Current mode: {current_mode}")
-            else:
-                new = parts[1].lower()
-                if new in ("student", "teacher"):
-                    current_mode = new
-                    print(f"Switched mode -> {current_mode}")
-                else:
-                    print("Invalid mode; use '/mode student' or '/mode teacher'")
-            continue
-
-        # produce embedding
-        try:
-            embed_path = _generate_query_embed(embed_py, q)
-        except Exception as e:
-            print("Failed to produce embedding:", e)
+        # use internal retrieval + LLM glue (offline-safe) instead of spawning embed_query
+        if get_rag_answer_with_llm is None:
+            print("ERROR: internal RAG glue not available; ensure src.rag.rag_answer is importable")
             continue
 
         try:
-            res = get_rag_answer(bundle=bundle, embed=embed_path, query=q, k=k, model=model, mode=current_mode)
+            res = get_rag_answer_with_llm(bundle=bundle, question=q, mode=mode, k=k, embed_model=embed_model)
         except Exception as e:
-            print("Error running RAG:", e)
+            print("ERROR: get_rag_answer_with_llm failed:", e)
             continue
 
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        status = res.get("status")
+        answer = res.get("answer") or ""
+        sources = res.get("sources") or []
+        print(f"\n[status: {status}]\n")
+        if answer:
+            print(answer.strip())
+        else:
+            # show raw prompt / raw if no answer
+            raw = res.get("raw","")
+            print("No generated answer. Raw output:")
+            print(raw)
+
+        if sources:
+            print("\nSources:")
+            for s in sources:
+                print(" -", s)
 
         if res.get("status") == "refer_teacher":
             print("\nTeacher mode returned 'refer_teacher'. To inspect raw model output run with RAG_DEBUG=1.")
@@ -124,6 +124,11 @@ def main():
     p.add_argument("--embed-model", default="all-mpnet-base-v2")
     p.add_argument("--mode", choices=["student", "teacher"], default="student")
     args = p.parse_args()
+    # capture CLI args into locals so we don't reference `args` inside the REPL loop
+    bundle = args.bundle
+    k = args.k
+    embed_model = args.embed_model
+    mode = args.mode  # initial mode (can be changed interactively)
 
     interactive(bundle=args.bundle, model=args.model, k=args.k, embed_model=args.embed_model, mode=args.mode)
 
